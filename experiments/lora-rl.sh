@@ -15,7 +15,7 @@ python reasoning-gym/training/train_grpo.py \
   actor_rollout_ref.model.path=models/Qwen2.5-3B-Instruct \
   actor_rollout_ref.model.lora_rank=64 \
   actor_rollout_ref.model.lora_alpha=16 \
-  actor_rollout_ref.actor.optim.lr=3e-6 \
+  actor_rollout_ref.actor.optim.lr=1e-5 \
   actor_rollout_ref.rollout.tensor_model_parallel_size=1 \
   actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=16 \
   trainer.n_gpus_per_node=4 \
