@@ -1,0 +1,23 @@
+# logs & run outputs
+*.log
+nohup.out
+outputs/
+wandb/
+
+# model weights / checkpoints (too large for GitHub)
+models/
+openvla-7b-finetuned-libero-spatial/
+prism-qwen25-extra-dinosiglip-224px-0_5b/
+*.safetensors
+*.pt
+*.bin
+
+# python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+
+# misc
+.cache/
+.DS_Store

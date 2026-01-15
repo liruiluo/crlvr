@@ -1,0 +1,34 @@
+# Config used for evaluating curriculum generalisation experiment models on Knights and Knaves
+
+# Models evaluated on this config:
+# Qwen/Qwen2.5-3B-Instruct (original model)
+# qwen3b_knights-knaves_noncurriculum (original + 300 GRPO steps on non-curriculum Knights and Knaves data)
+# qwen3b_knights-knaves_curriculum (original + 300 GRPO steps on curriculum Knights and Knaves data)
+
+model_path: Qwen/Qwen2.5-3B-Instruct  # Default model path
+# model_path: /workspace/reasoning-gym/training/qwen3b_knights-knaves_noncurriculum
+# model_path: /workspace/reasoning-gym/training/qwen3b_knights-knaves_curriculum
+
+max_tokens: 2048  # From max_response_length in training config
+top_p: 1.0
+temperature: 1.0  # Lower temperature for more focused responses
+dtype: bfloat16
+
+developer_prompt: DeepSeekZero
+developer_role: system
+
+output_dir: results
+save_metadata: true
+save_full_results: true
+eval_repeats: 3
+
+categories:
+  - category: logic
+    datasets:
+      - dataset: knights_knaves
+        size: 100
+        seed: 42
+        params:
+          n_people: 4
+          depth_constraint: 3
+          width_constraint: 3
