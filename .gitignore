@@ -21,3 +21,6 @@ __pycache__/
 # misc
 .cache/
 .DS_Store
+
+# training checkpoints
+checkpoints/
