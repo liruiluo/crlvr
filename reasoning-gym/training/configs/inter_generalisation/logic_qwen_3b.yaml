@@ -37,6 +37,15 @@ curriculum:
       spell_backward:
         attribute_levels:
           word_len: 0
+
+continual:
+  enabled: False
+  steps_per_task: null
+  override_total_training_steps: false
+  save_ckpt_on_task_end: true
+  eval_on_task_start: false
+  eval_on_task_end: false
+  tasks: null
 reward:
   use_accuracy: True
   secondary_rewards:

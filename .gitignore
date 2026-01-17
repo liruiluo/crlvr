@@ -1,6 +1,8 @@
 # logs & run outputs
 *.log
 nohup.out
+*.pid
+smoke_eval*.out
 outputs/
 wandb/
 

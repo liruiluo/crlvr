@@ -2,8 +2,13 @@
 # https://github.com/volcengine/verl/blob/a65c9157bc0b85b64cd753de19f94e80a11bd871/verl/trainer/main_ppo.py
 
 import gc
+import json
+import math
 import uuid
 from copy import deepcopy
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Optional
 
 import numpy as np
 import torch
@@ -31,6 +36,17 @@ from verl.single_controller.ray import RayClassWithInitArgs, RayResourcePool, Ra
 from reasoning_gym.utils import extract_answer
 from verl.protocol import pad_dataproto_to_divisor, unpad_dataproto
 
+import reasoning_gym
+from reasoning_gym.composite import DatasetSpec
+
+
+@dataclass(frozen=True)
+class ContinualTaskSpec:
+    name: str
+    datasets: dict[str, dict[str, Any]]  # dataset_name -> {"weight": float, "config": dict}
+    start_step: int  # inclusive, 1-based
+    end_step: int  # inclusive, 1-based
+
 class RayGRPOTrainer(RayPPOTrainer):
     def __init__(
         self,
@@ -43,6 +59,8 @@ class RayGRPOTrainer(RayPPOTrainer):
         ray_worker_group_cls,
         max_output_length: int = 1024,
     ):
+        # Keep a reference early (before base class init) so continual mode helpers can use it.
+        self.config = config
         self.train_dataset = train_dataset
         self.val_dataset = val_dataset
         self.max_output_length = max_output_length
@@ -51,6 +69,24 @@ class RayGRPOTrainer(RayPPOTrainer):
             self.last_k = config.curriculum.last_k
         else:
             self.last_k = None
+
+        self.continual_enabled = False
+        self.continual_tasks: list[ContinualTaskSpec] = []
+        self.continual_current_task_idx: Optional[int] = None
+        self.checkpoint_saved_steps: set[int] = set()
+
+        continual_cfg = getattr(config, "continual", None)
+        if continual_cfg is not None and bool(continual_cfg.get("enabled", False)):
+            if config.curriculum.enabled:
+                raise ValueError("continual.enabled=True is not supported with curriculum.enabled=True")
+            self.continual_enabled = True
+            self.continual_tasks = self.build_continual_schedule(config, continual_cfg)
+
+            if self.continual_tasks:
+                # Apply first task before base trainer initialization (dataloaders/samplers).
+                self.apply_continual_task(task_idx=0)
+                self.continual_current_task_idx = 0
+                self.dump_continual_schedule()
 
         self.reward_functions = []
         if hasattr(config, "reward") and hasattr(config.reward, "secondary_rewards"):
@@ -81,6 +117,243 @@ class RayGRPOTrainer(RayPPOTrainer):
             reward_fn=train_reward_fn,
             val_reward_fn=val_reward_fn,
         )
+
+    def dataset_cfg_to_dict(self, dataset_cfg: Any) -> dict[str, Any]:
+        weight = float(dataset_cfg.get("weight", 1.0))
+        cfg = {}
+        if "config" in dataset_cfg and dataset_cfg.config is not None:
+            cfg = OmegaConf.to_container(dataset_cfg.config, resolve=True)
+            if cfg is None:
+                cfg = {}
+        return {"weight": weight, "config": dict(cfg)}
+
+    def build_continual_schedule(self, config, continual_cfg) -> list[ContinualTaskSpec]:
+        base_datasets_cfg = config.reasoning_gym.datasets
+        base_dataset_defs: dict[str, dict[str, Any]] = {
+            ds_name: self.dataset_cfg_to_dict(ds_cfg) for ds_name, ds_cfg in base_datasets_cfg.items()
+        }
+
+        tasks_cfg = continual_cfg.get("tasks", None)
+        if tasks_cfg:
+            raw_tasks = tasks_cfg
+        else:
+            # Default: one task per dataset in config order.
+            raw_tasks = list(base_dataset_defs.keys())
+
+        normalized_tasks: list[dict[str, Any]] = []
+        for item in raw_tasks:
+            if isinstance(item, str):
+                dataset_name = item
+                if dataset_name not in base_dataset_defs:
+                    raise ValueError(
+                        f"continual.tasks references unknown dataset '{dataset_name}' "
+                        f"(not in reasoning_gym.datasets)"
+                    )
+                normalized_tasks.append(
+                    {"name": dataset_name, "datasets": {dataset_name: base_dataset_defs[dataset_name]}}
+                )
+                continue
+
+            # DictConfig behaves like a dict for .get()/iteration.
+            task_name = item.get("name", None)
+            datasets = item.get("datasets", None)
+            dataset_single = item.get("dataset", None)
+
+            if datasets is None and dataset_single is not None:
+                datasets = {dataset_single: item.get("dataset_config", {})}
+
+            if datasets is None:
+                raise ValueError("continual.tasks items must be string, or have 'dataset' or 'datasets' fields")
+
+            task_datasets: dict[str, dict[str, Any]] = {}
+            for ds_name, ds_override in dict(datasets).items():
+                if ds_name not in base_dataset_defs:
+                    raise ValueError(
+                        f"continual.tasks references unknown dataset '{ds_name}' "
+                        f"(not in reasoning_gym.datasets)"
+                    )
+                base_def = deepcopy(base_dataset_defs[ds_name])
+
+                # Optional overrides.
+                if ds_override is None:
+                    task_datasets[ds_name] = base_def
+                    continue
+
+                if isinstance(ds_override, dict) or hasattr(ds_override, "get"):
+                    override_weight = ds_override.get("weight", None)
+                    override_config = ds_override.get("config", None)
+                    if override_weight is not None:
+                        base_def["weight"] = float(override_weight)
+                    if override_config is not None:
+                        base_def["config"].update(dict(override_config))
+                task_datasets[ds_name] = base_def
+
+            if not task_name:
+                if len(task_datasets) == 1:
+                    task_name = next(iter(task_datasets.keys()))
+                else:
+                    task_name = "phase_" + "_".join(task_datasets.keys())
+
+            normalized_tasks.append({"name": str(task_name), "datasets": task_datasets, "steps": item.get("steps")})
+
+        if not normalized_tasks:
+            return []
+
+        steps_per_task = continual_cfg.get("steps_per_task", None)
+        override_total = bool(continual_cfg.get("override_total_training_steps", False))
+
+        if steps_per_task is not None:
+            steps_per_task = int(steps_per_task)
+            if steps_per_task <= 0:
+                raise ValueError("continual.steps_per_task must be positive")
+            total_steps = steps_per_task * len(normalized_tasks)
+            if override_total:
+                with open_dict(config):
+                    config.trainer.total_training_steps = total_steps
+        else:
+            total_steps = int(config.trainer.total_training_steps)
+
+        # Allocate per-task steps.
+        steps_list: list[int] = []
+        if steps_per_task is not None:
+            steps_list = [steps_per_task] * len(normalized_tasks)
+        else:
+            explicit_steps = [t.get("steps") for t in normalized_tasks]
+            has_any_explicit = any(s is not None for s in explicit_steps)
+
+            if has_any_explicit:
+                fixed = [int(s) if s is not None else None for s in explicit_steps]
+                if any(s is not None and s <= 0 for s in fixed):
+                    raise ValueError("continual.tasks[*].steps must be positive when provided")
+
+                sum_fixed = sum(s for s in fixed if s is not None)
+                if sum_fixed > total_steps:
+                    raise ValueError(
+                        f"Sum of continual.tasks[*].steps ({sum_fixed}) exceeds trainer.total_training_steps ({total_steps})"
+                    )
+
+                missing = [i for i, s in enumerate(fixed) if s is None]
+                remaining = total_steps - sum_fixed
+                if missing and remaining <= 0:
+                    raise ValueError(
+                        "Some continual.tasks[*].steps are missing, but no remaining steps to allocate "
+                        f"(sum_fixed={sum_fixed}, total={total_steps})"
+                    )
+
+                if missing:
+                    base = remaining // len(missing)
+                    remainder = remaining % len(missing)
+                    if base <= 0:
+                        raise ValueError(
+                            f"Remaining steps ({remaining}) is too small for {len(missing)} tasks without explicit steps"
+                        )
+                    for j, idx in enumerate(missing):
+                        fixed[idx] = base + (1 if j < remainder else 0)
+
+                steps_list = [int(s) for s in fixed]  # now fully filled
+            else:
+                base = total_steps // len(normalized_tasks)
+                remainder = total_steps % len(normalized_tasks)
+                if base <= 0:
+                    raise ValueError(
+                        f"trainer.total_training_steps ({total_steps}) is too small for {len(normalized_tasks)} tasks"
+                    )
+                for i in range(len(normalized_tasks)):
+                    steps_list.append(base + (1 if i < remainder else 0))
+
+        schedule: list[ContinualTaskSpec] = []
+        current = 1
+        for task, n_steps in zip(normalized_tasks, steps_list, strict=True):
+            end = current + int(n_steps) - 1
+            schedule.append(
+                ContinualTaskSpec(
+                    name=str(task["name"]),
+                    datasets=task["datasets"],
+                    start_step=current,
+                    end_step=end,
+                )
+            )
+            current = end + 1
+
+        return schedule
+
+    def continual_task_index_for_step(self, global_step: int) -> Optional[int]:
+        if not self.continual_tasks:
+            return None
+        for i, task in enumerate(self.continual_tasks):
+            if task.start_step <= global_step <= task.end_step:
+                return i
+        return None
+
+    def make_task_data_source(self, task: ContinualTaskSpec, seed: int):
+        dataset_size = int(self.config.reasoning_gym.dataset_size)
+        dataset_specs = [
+            DatasetSpec(name=ds_name, weight=float(ds_def["weight"]), config=dict(ds_def["config"]))
+            for ds_name, ds_def in task.datasets.items()
+        ]
+        return reasoning_gym.create_dataset("composite", seed=seed, size=dataset_size, datasets=dataset_specs)
+
+    def apply_continual_task(self, task_idx: int) -> None:
+        task = self.continual_tasks[task_idx]
+        print(
+            f"[continual] switch task={task.name} idx={task_idx} steps={task.start_step}-{task.end_step} "
+            f"datasets={list(task.datasets.keys())}"
+        )
+        # Match train_grpo.py seeding convention, but keep seeds task-specific for diversity.
+        seed_offset = 1000 * task_idx
+        train_source = self.make_task_data_source(task, seed=1 + seed_offset)
+        val_source = self.make_task_data_source(task, seed=2 + seed_offset)
+        self.train_dataset.data = train_source
+        self.val_dataset.data = val_source
+
+    def dump_continual_schedule(self) -> None:
+        base_dir = Path(str(self.config.trainer.default_local_dir))
+        base_dir.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "total_training_steps": int(self.config.trainer.total_training_steps),
+            "tasks": [
+                {
+                    "name": t.name,
+                    "start_step": t.start_step,
+                    "end_step": t.end_step,
+                    "datasets": t.datasets,
+                }
+                for t in self.continual_tasks
+            ],
+        }
+        (base_dir / "continual_schedule.json").write_text(json.dumps(payload, indent=2, ensure_ascii=False))
+
+    def maybe_save_checkpoint(self, reason: str) -> bool:
+        step = int(self.global_steps)
+        did_save = step not in self.checkpoint_saved_steps
+        if did_save:
+            self.checkpoint_saved_steps.add(step)
+            print(f"[continual] save checkpoint step={step} reason={reason}")
+            self._save_checkpoint()
+        else:
+            print(f"[continual] checkpoint already saved step={step}; record reason={reason}")
+
+        if self.continual_enabled:
+            base_dir = Path(str(self.config.trainer.default_local_dir))
+            base_dir.mkdir(parents=True, exist_ok=True)
+            path = base_dir / "continual_task_checkpoints.jsonl"
+            record = {"global_step": step, "reason": reason, "task": None, "saved": did_save}
+            if self.continual_current_task_idx is not None and 0 <= self.continual_current_task_idx < len(
+                self.continual_tasks
+            ):
+                record["task"] = self.continual_tasks[self.continual_current_task_idx].name
+            with path.open("a", encoding="utf-8") as f:
+                f.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+        return did_save
+
+    def rollout_pad_divisor(self) -> int:
+        divisor = int(getattr(self.actor_rollout_wg, "world_size", 1))
+        if self.async_rollout_mode:
+            workers = getattr(self.async_rollout_manager, "agent_loop_workers", None)
+            if workers is not None:
+                divisor = math.lcm(divisor, len(workers))
+        return max(divisor, 1)
 
     def init_workers(self):
         """Initialize distributed training workers using Ray backend.
@@ -244,7 +517,7 @@ class RayGRPOTrainer(RayPPOTrainer):
             print(f'test_gen_batch meta info: {test_gen_batch.meta_info}')
 
             # pad to be divisible by dp_size
-            test_gen_batch_padded, pad_size = pad_dataproto_to_divisor(test_gen_batch, self.actor_rollout_wg.world_size)
+            test_gen_batch_padded, pad_size = pad_dataproto_to_divisor(test_gen_batch, self.rollout_pad_divisor())
             if not self.async_rollout_mode:
                 test_output_gen_batch_padded = self.actor_rollout_wg.generate_sequences(test_gen_batch_padded)
             else:
@@ -447,9 +720,31 @@ class RayGRPOTrainer(RayPPOTrainer):
         # we start from step 1
         self.global_steps += 1
         last_val_metrics = None
+
+        if self.continual_enabled:
+            task_idx = self.continual_task_index_for_step(int(self.global_steps))
+            if task_idx is not None and task_idx != self.continual_current_task_idx:
+                self.apply_continual_task(task_idx=task_idx)
+                self.continual_current_task_idx = task_idx
+            if bool(getattr(self.config.continual, "eval_on_task_start", False)):
+                with _timer("continual_eval_start", timing_raw := {}):
+                    val_metrics = self._validate()
+                prefixed = {f"continual/task_start_eval/{k}": v for k, v in val_metrics.items()}
+                logger.log(data=prefixed, step=self.global_steps)
         
         for epoch in range(self.config.trainer.total_epochs):
             for batch_dict in self.train_dataloader:
+                if self.continual_enabled:
+                    task_idx = self.continual_task_index_for_step(int(self.global_steps))
+                    if task_idx is not None and task_idx != self.continual_current_task_idx:
+                        self.apply_continual_task(task_idx=task_idx)
+                        self.continual_current_task_idx = task_idx
+                        if bool(getattr(self.config.continual, "eval_on_task_start", False)):
+                            with _timer("continual_eval_start", timing_raw := {}):
+                                val_metrics = self._validate()
+                            prefixed = {f"continual/task_start_eval/{k}": v for k, v in val_metrics.items()}
+                            logger.log(data=prefixed, step=self.global_steps)
+
                 if hasattr(self.actor_rollout_wg, "async_calls_finalize_fn_exec"):
                     self.actor_rollout_wg.async_calls_finalize_fn_exec(blocking=False)
                 metrics = {}
@@ -478,7 +773,11 @@ class RayGRPOTrainer(RayPPOTrainer):
                         if not self.async_rollout_mode:
                             gen_batch_output = self.actor_rollout_wg.generate_sequences(gen_batch_output)
                         else:
-                            gen_batch_output = self.async_rollout_manager.generate_sequences(gen_batch_output)
+                            gen_batch_output_padded, pad_size = pad_dataproto_to_divisor(
+                                gen_batch_output, self.rollout_pad_divisor()
+                            )
+                            gen_batch_output_padded = self.async_rollout_manager.generate_sequences(gen_batch_output_padded)
+                            gen_batch_output = unpad_dataproto(gen_batch_output_padded, pad_size=pad_size)
 
                         timing_raw.update(gen_batch_output.meta_info["timing"])
                         gen_batch_output.meta_info.pop("timing", None)
@@ -490,7 +789,13 @@ class RayGRPOTrainer(RayPPOTrainer):
                             if not self.async_rollout_mode:
                                 gen_baseline_output = self.actor_rollout_wg.generate_sequences(gen_baseline_batch)
                             else:
-                                gen_baseline_output = self.async_rollout_manager.generate_sequences(gen_baseline_batch)
+                                gen_baseline_batch_padded, pad_size = pad_dataproto_to_divisor(
+                                    gen_baseline_batch, self.rollout_pad_divisor()
+                                )
+                                gen_baseline_output_padded = self.async_rollout_manager.generate_sequences(
+                                    gen_baseline_batch_padded
+                                )
+                                gen_baseline_output = unpad_dataproto(gen_baseline_output_padded, pad_size=pad_size)
                             batch = batch.union(gen_baseline_output)
 
                             reward_baseline_tensor = self.reward_fn(batch)
@@ -589,7 +894,7 @@ class RayGRPOTrainer(RayPPOTrainer):
                         is_last_step or self.global_steps % self.config.trainer.save_freq == 0
                     ):
                         with _timer("save_checkpoint", timing_raw):
-                            self._save_checkpoint()
+                            self.maybe_save_checkpoint(reason="periodic")
 
                 # collect metrics
                 if self.config.curriculum.enabled:
@@ -621,7 +926,26 @@ class RayGRPOTrainer(RayPPOTrainer):
                 # TODO: implement actual tflpo and theoretical tflpo
 
                 # TODO: make a canonical logger that supports various backend
+                if self.continual_enabled and self.continual_current_task_idx is not None:
+                    metrics["continual/task_index"] = float(self.continual_current_task_idx)
                 logger.log(data=metrics, step=self.global_steps)
+
+                if self.continual_enabled and self.continual_current_task_idx is not None:
+                    task = self.continual_tasks[self.continual_current_task_idx]
+                    if (
+                        bool(getattr(self.config.continual, "eval_on_task_end", False))
+                        and int(self.global_steps) == int(task.end_step)
+                    ):
+                        with _timer("continual_eval_end", timing_raw := {}):
+                            val_metrics = self._validate()
+                        prefixed = {f"continual/task_end_eval/{k}": v for k, v in val_metrics.items()}
+                        logger.log(data=prefixed, step=self.global_steps)
+
+                    if (
+                        bool(getattr(self.config.continual, "save_ckpt_on_task_end", True))
+                        and int(self.global_steps) == int(task.end_step)
+                    ):
+                        self.maybe_save_checkpoint(reason="task_end")
 
                 if is_last_step:
                     print(f"Final validation metrics: {last_val_metrics}")
