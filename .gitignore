@@ -21,3 +21,7 @@ __pycache__/
 # misc
 .cache/
 .DS_Store
+
+*DEBUG*
+*1step*
+*pid*

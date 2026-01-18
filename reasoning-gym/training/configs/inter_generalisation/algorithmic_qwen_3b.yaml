@@ -86,7 +86,11 @@ actor_rollout_ref:
   model:
     path: Qwen/Qwen2.5-3B-Instruct
     external_lib: null
-    override_config: { }
+    override_config:
+      moe_lora_enable: False
+      moe_lora_num_experts: 4
+      moe_lora_top_k: 2
+      moe_lora_router_init_std: 0.02
     enable_gradient_checkpointing: True
     use_remove_padding: True
   actor:

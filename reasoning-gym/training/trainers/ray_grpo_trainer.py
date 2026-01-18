@@ -451,7 +451,10 @@ class RayGRPOTrainer(RayPPOTrainer):
         for epoch in range(self.config.trainer.total_epochs):
             for batch_dict in self.train_dataloader:
                 if hasattr(self.actor_rollout_wg, "async_calls_finalize_fn_exec"):
-                    self.actor_rollout_wg.async_calls_finalize_fn_exec(blocking=False)
+                    # Ensure any pending async calls are fully finalized before starting
+                    # a new training iteration; mixed async/sync ordering can lead to
+                    # mismatched collectives (HCCL/NCCL timeouts) on some setups.
+                    self.actor_rollout_wg.async_calls_finalize_fn_exec(blocking=True)
                 metrics = {}
                 timing_raw = {}
 
@@ -516,9 +519,14 @@ class RayGRPOTrainer(RayPPOTrainer):
 
                     # recompute old_log_probs
                     with _timer("old_log_prob", timing_raw):
-                        #TODO: entropy etc
-                        old_log_prob = self.actor_rollout_wg.compute_log_prob(batch)
-                        batch = batch.union(old_log_prob)
+                        # Prefer rollout-provided token logprobs when available to avoid an extra
+                        # distributed recomputation pass (can deadlock on some setups).
+                        if "rollout_log_probs" in batch.batch:
+                            batch.batch["old_log_probs"] = batch.batch["rollout_log_probs"]
+                        else:
+                            # TODO: entropy etc
+                            old_log_prob = self.actor_rollout_wg.compute_log_prob(batch)
+                            batch = batch.union(old_log_prob)
 
                     if self.use_reference_policy:
                         # compute reference log_prob
